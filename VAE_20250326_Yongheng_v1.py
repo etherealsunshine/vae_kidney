@@ -1,4 +1,7 @@
 import os
+#add seed to control for hashing order
+os.environ['PYTHONHASHSEED'] = '42'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import sys
 import logging
 import random
@@ -18,6 +21,11 @@ random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+
+
+# Make PyTorch operations deterministic
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
@@ -41,12 +49,29 @@ class CellDataset(Dataset):
 class VAEClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, num_classes=2):
         super(VAEClassifier, self).__init__()
+        # Reset seed right before weight initialization for reproducible weights
+        torch.manual_seed(42)
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
         self.fc_dec1 = nn.Linear(latent_dim, hidden_dim)
         self.fc_dec2 = nn.Linear(hidden_dim, input_dim)
         self.classifier = nn.Linear(latent_dim, num_classes)
+        # Initialize weights using a deterministic method
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Custom weight initialization to ensure deterministic behavior.
+        PyTorch's default initialization uses random values, so we
+        need to control the randomness carefully.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use a fixed initialization scheme
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def encode(self, x):
         h = F.relu(self.fc1(x))
@@ -55,8 +80,11 @@ class VAEClassifier(nn.Module):
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
+        # Reset seed for sampling - this is crucial for VAE reproducibility
+        torch.manual_seed(42)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
+        
         return mu + eps * std
 
     def decode(self, z):
@@ -136,7 +164,10 @@ for cell_type in cell_types:
     input_dim = len(gene_names)
 
     dataset = CellDataset(expr_df, gene_names)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    #added a deterministic random number generator for Dataloader
+    g = torch.Generator()
+    g.manual_seed(42)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,generator=g)
 
     model = VAEClassifier(input_dim, hidden_dim, latent_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -148,8 +179,16 @@ for cell_type in cell_types:
     model.train()
 
     for epoch in range(num_epochs):
+        # Reset seed at the beginning of each epoch with a unique but deterministic value
+        epoch_seed = 42 + epoch
+        torch.manual_seed(epoch_seed)
+        np.random.seed(epoch_seed)
+        random.seed(epoch_seed)
         total_loss = 0
-        for batch_x, batch_y in dataloader:
+        for batch_idx,(batch_x, batch_y) in dataloader:
+            # Set a unique but deterministic seed for each batch
+            batch_seed = 42 + epoch * 1000 + batch_idx
+            torch.manual_seed(batch_seed)
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             optimizer.zero_grad()
@@ -161,7 +200,7 @@ for cell_type in cell_types:
         avg_loss = total_loss / len(dataset)
         log.info(f"Epoch {epoch+1}/{num_epochs} for cell type {cell_type}, Loss: {avg_loss:.4f}")
 
-        if avg_loss < best_loss:
+        if avg_loss < best_loss* 0.99:#we're looking for >1% improvement
             best_loss = avg_loss
             best_model_state = model.state_dict()
             patience_counter = 0
@@ -176,21 +215,27 @@ for cell_type in cell_types:
         model.load_state_dict(best_model_state)
 
     model.eval()
-    ig = IntegratedGradients(classifier_forward)
+    # Reset seed for evaluation
+    torch.manual_seed(42)  
 
+    ig = IntegratedGradients(classifier_forward)
+    #creating a reference point for IG algorithm 
+    baseline = torch.zeros((1, input_dim)).to(device)
     attributions_group = {cls: [] for cls in le.classes_}
     details_group = {cls: [] for cls in le.classes_}
 
-    baseline = torch.zeros((1, input_dim)).to(device)
 
     all_X = torch.tensor(dataset.X, device=device)
     all_y = torch.tensor(dataset.y, device=device)
     for i in range(len(all_X)):
+        # Set a unique but deterministic seed for each sample
+        sample_seed = 42 + i
+        torch.manual_seed(sample_seed)
         cell_id = dataset.df.index[i]
         patient = dataset.df.loc[cell_id, "Patient"]
         x = all_X[i].unsqueeze(0)
         target = int(all_y[i])
-        attr, _ = ig.attribute(x, baseline, target=target, return_convergence_delta=True)
+        attr, _ = ig.attribute(x, baseline, target=target, return_convergence_delta=True,n_steps=100,internal_batch_size=1)
         attr = attr.squeeze(0).cpu().numpy()
         group_name = le.inverse_transform([target])[0]
         attributions_group[group_name].append(attr)
@@ -200,6 +245,7 @@ for cell_type in cell_types:
             "attribution": attr
         })
 
+    # Calculate attribution summaries
     avg_attr = {}
     pos_percent = {}
     for group, attr_list in attributions_group.items():
@@ -207,13 +253,15 @@ for cell_type in cell_types:
         avg_attr[group] = np.mean(attr_array, axis=0)
         pos_percent[group] = (attr_array > 0).mean(axis=0) * 100
 
-    for group in avg_attr:
+    # Process results in a deterministic order by sorting group names
+    for group in sorted(avg_attr.keys()):
         df_summary = pd.DataFrame({
             "gene": gene_names,
             "average_importance": avg_attr[group],
             "positive_percentage": pos_percent[group]
         })
 
+        # Sort consistently
         df_summary = df_summary.reindex(df_summary['average_importance'].abs().sort_values(ascending=False).index)
         output_file = os.path.join(cell_type_dir, f"VAE_{group}.csv")
         df_summary.to_csv(output_file, index=False)
@@ -226,8 +274,10 @@ for cell_type in cell_types:
                 if detail["attribution"][gi] > 0:
                     cells.append(detail["cell_id"])
                     patients.append(detail["patient"])
-            cells = list(set(cells))
-            patients = list(set(patients))
+        
+            # Sort to ensure consistent output strings
+            cells = sorted(list(set(cells)))
+            patients = sorted(list(set(patients)))
 
             gene_details.append({
                 "gene": gene,
@@ -237,6 +287,7 @@ for cell_type in cell_types:
             })
 
         df_gene_details = pd.DataFrame(gene_details)
+        # Sort consistently
         df_gene_details = df_gene_details.reindex(df_gene_details['positive_percentage'].abs().sort_values(ascending=False).index)
         details_output = os.path.join(cell_type_dir, f"VAE_Gene_info_{group}.csv")
         df_gene_details.to_csv(details_output, index=False)
